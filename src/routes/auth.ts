@@ -224,6 +224,48 @@ router.post('/logout', async (req: AuthRequest, res, next) => {
   }
 });
 
+// Verify token
+router.get('/verify', async (req: AuthRequest, res, next) => {
+  try {
+    if (!req.user) {
+      throw new AppError(401, 'Unauthorized');
+    }
+
+    // Get user with organization
+    const [user] = await db
+      .select({
+        id: users.id,
+        email: users.email,
+        name: users.name,
+        role: users.role,
+        organizationId: users.organizationId,
+        organizationName: organizations.name,
+      })
+      .from(users)
+      .innerJoin(organizations, eq(users.organizationId, organizations.id))
+      .where(eq(users.id, req.user.id))
+      .limit(1);
+
+    if (!user) {
+      throw new AppError(404, 'User not found');
+    }
+
+    res.json({
+      success: true,
+      user: {
+        id: user.id,
+        email: user.email,
+        name: user.name,
+        role: user.role,
+        organizationId: user.organizationId,
+        organizationName: user.organizationName,
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
 // Refresh token
 router.post('/refresh', async (req, res, next) => {
   try {

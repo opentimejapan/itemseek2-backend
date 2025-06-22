@@ -5,6 +5,15 @@ import { inventoryItems, inventoryMovements, inventoryCounts, categories, locati
 import { eq, and, like, gte, lte } from 'drizzle-orm';
 import { AuthRequest, authorize } from '../middleware/auth';
 import { AppError } from '../middleware/errorHandler';
+import { getWebSocketService } from '../services/websocket/socketServer';
+import { 
+  emitInventoryCreated, 
+  emitInventoryUpdated, 
+  emitInventoryDeleted,
+  emitQuantityChanged,
+  emitLowStockAlert,
+  emitInventoryMovement 
+} from '../services/websocket/inventoryEvents';
 
 const router = Router();
 
@@ -145,14 +154,29 @@ router.post('/', authorize('manager', 'org_admin', 'system_admin'), async (req: 
       .returning();
 
     // Record initial inventory movement
-    await db.insert(inventoryMovements).values({
+    const [movement] = await db.insert(inventoryMovements).values({
       itemId: newItem.id,
       type: 'in',
       quantity: data.quantity,
       toLocation: data.location,
       reason: 'Initial stock',
       userId: req.user!.id,
-    });
+    }).returning();
+
+    // Emit WebSocket events
+    try {
+      const io = req.app.get('socketService').io;
+      emitInventoryCreated(io, req.user!.organizationId, newItem);
+      emitInventoryMovement(io, req.user!.organizationId, movement);
+      
+      // Check if low stock
+      if (newItem.quantity <= newItem.minQuantity) {
+        emitLowStockAlert(io, req.user!.organizationId, [newItem]);
+      }
+    } catch (error) {
+      // Don't fail the request if WebSocket fails
+      console.error('WebSocket emit error:', error);
+    }
 
     res.status(201).json({ success: true, data: newItem });
   } catch (error) {
@@ -192,6 +216,19 @@ router.patch('/:itemId', authorize('manager', 'org_admin', 'system_admin'), asyn
       })
       .where(eq(inventoryItems.id, itemId))
       .returning();
+
+    // Emit WebSocket events
+    try {
+      const io = req.app.get('socketService').io;
+      emitInventoryUpdated(io, req.user!.organizationId, updatedItem, data);
+      
+      // Check if low stock after update
+      if (updatedItem.quantity <= updatedItem.minQuantity) {
+        emitLowStockAlert(io, req.user!.organizationId, [updatedItem]);
+      }
+    } catch (error) {
+      console.error('WebSocket emit error:', error);
+    }
 
     res.json({ success: true, data: updatedItem });
   } catch (error) {
@@ -237,15 +274,42 @@ router.post('/:itemId/quantity', async (req: AuthRequest, res, next) => {
       .returning();
 
     // Record movement
+    let movement;
     if (quantityDiff !== 0) {
-      await db.insert(inventoryMovements).values({
+      [movement] = await db.insert(inventoryMovements).values({
         itemId,
         type: quantityDiff > 0 ? 'in' : 'out',
         quantity: Math.abs(quantityDiff),
         toLocation: item.location,
         reason: reason || 'Manual adjustment',
         userId: req.user!.id,
+      }).returning();
+    }
+
+    // Emit WebSocket events
+    try {
+      const io = req.app.get('socketService').io;
+      emitQuantityChanged(io, req.user!.organizationId, {
+        itemId,
+        previousQuantity: item.quantity,
+        newQuantity: quantity,
+        reason: reason || 'Manual adjustment',
+        userId: req.user!.id,
       });
+      
+      if (movement) {
+        emitInventoryMovement(io, req.user!.organizationId, movement);
+      }
+      
+      // Check stock levels
+      if (quantity <= updatedItem.minQuantity && item.quantity > item.minQuantity) {
+        emitLowStockAlert(io, req.user!.organizationId, [updatedItem]);
+      } else if (quantity === 0 && item.quantity > 0) {
+        const { emitOutOfStockAlert } = require('../services/websocket/inventoryEvents');
+        emitOutOfStockAlert(io, req.user!.organizationId, itemId);
+      }
+    } catch (error) {
+      console.error('WebSocket emit error:', error);
     }
 
     res.json({ success: true, data: updatedItem });
@@ -275,6 +339,14 @@ router.delete('/:itemId', authorize('org_admin', 'system_admin'), async (req: Au
 
     // Delete item (cascades will handle related records)
     await db.delete(inventoryItems).where(eq(inventoryItems.id, itemId));
+
+    // Emit WebSocket event
+    try {
+      const io = req.app.get('socketService').io;
+      emitInventoryDeleted(io, req.user!.organizationId, itemId);
+    } catch (error) {
+      console.error('WebSocket emit error:', error);
+    }
 
     res.json({ success: true });
   } catch (error) {
